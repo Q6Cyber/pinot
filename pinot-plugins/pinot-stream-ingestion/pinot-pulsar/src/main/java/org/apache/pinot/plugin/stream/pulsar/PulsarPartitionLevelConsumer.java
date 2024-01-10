@@ -18,7 +18,6 @@
  */
 package org.apache.pinot.plugin.stream.pulsar;
 
-import com.google.common.collect.Iterables;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
