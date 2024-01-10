@@ -23,11 +23,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
 import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
 import org.apache.pinot.spi.stream.StreamConfig;
@@ -125,13 +127,20 @@ public class PulsarPartitionLevelConsumer extends PulsarPartitionLevelConnection
     }
   }
 
-  private Iterable<PulsarStreamMessage> buildOffsetFilteringIterable(final List<PulsarStreamMessage> messageAndOffsets,
+  private List<PulsarStreamMessage> buildOffsetFilteringIterable(
+      final List<PulsarStreamMessage> messageAndOffsets,
       final MessageId startOffset, final MessageId endOffset) {
-    return Iterables.filter(messageAndOffsets, input -> {
-      // Filter messages that are either null or have an offset ∉ [startOffset, endOffset]
-      return input != null && input.getValue() != null && (input.getMessageId().compareTo(startOffset) >= 0) && (
-          (endOffset == null) || (input.getMessageId().compareTo(endOffset) < 0));
-    });
+    return messageAndOffsets.stream()
+        .filter(Objects::nonNull)
+        .filter(message -> message.getValue() != null)
+        .filter(message -> message.getMessageId().compareTo(startOffset) >= 0)
+        .filter(message -> endOffset == null || message.getMessageId().compareTo(endOffset) < 0)
+        .collect(Collectors.toList());
+//    return Iterables.filter(messageAndOffsets, input -> {
+//      // Filter messages that are either null or have an offset ∉ [startOffset, endOffset]
+//      return input != null && input.getValue() != null && (input.getMessageId().compareTo(startOffset) >= 0) && (
+//          (endOffset == null) || (input.getMessageId().compareTo(endOffset) < 0));
+//    });
   }
 
   @Override
