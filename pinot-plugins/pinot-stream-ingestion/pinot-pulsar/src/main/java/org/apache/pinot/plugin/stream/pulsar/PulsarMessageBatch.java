@@ -19,7 +19,6 @@
 package org.apache.pinot.plugin.stream.pulsar;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.List;
 import org.apache.pinot.spi.stream.MessageBatch;
 import org.apache.pinot.spi.stream.RowMetadata;
@@ -38,11 +37,11 @@ import org.apache.pulsar.client.internal.DefaultImplementation;
  * them independently.
  */
 public class PulsarMessageBatch implements MessageBatch<PulsarStreamMessage> {
-  private final List<PulsarStreamMessage> _messageList = new ArrayList<>();
+  private final List<PulsarStreamMessage> _messageList;
   private final boolean _enableKeyValueStitch;
 
-  public PulsarMessageBatch(Iterable<PulsarStreamMessage> iterable, boolean enableKeyValueStitch) {
-    iterable.forEach(_messageList::add);
+  public PulsarMessageBatch(final List<PulsarStreamMessage> messages, boolean enableKeyValueStitch) {
+    _messageList = messages;
     _enableKeyValueStitch = enableKeyValueStitch;
   }
 
@@ -100,7 +99,16 @@ public class PulsarMessageBatch implements MessageBatch<PulsarStreamMessage> {
    */
   @Override
   public StreamPartitionMsgOffset getNextStreamPartitionMsgOffsetAtIndex(int index) {
-    MessageIdImpl currentMessageId = MessageIdImpl.convertToMessageIdImpl(_messageList.get(index).getMessageId());
+//    MessageIdImpl currentMessageId = MessageIdImpl.convertToMessageIdImpl(_messageList.get(index).getMessageId());
+    MessageIdImpl currentMessageId;
+    try {
+      currentMessageId = (MessageIdImpl) MessageIdImpl.fromByteArray(_messageList.get(index).getMessageId()
+          .toByteArray());
+    } catch (Exception e) {
+        throw new RuntimeException("Failed to convert MessageId to MessageIdImpl", e);
+    }
+
+
     MessageId nextMessageId;
 
     long currentLedgerId = currentMessageId.getLedgerId();
@@ -108,17 +116,17 @@ public class PulsarMessageBatch implements MessageBatch<PulsarStreamMessage> {
     int currentPartitionIndex = currentMessageId.getPartitionIndex();
 
     if (currentMessageId instanceof BatchMessageIdImpl) {
-      int currentBatchIndex = ((BatchMessageIdImpl) currentMessageId).getBatchIndex();
-      int currentBatchSize = ((BatchMessageIdImpl) currentMessageId).getBatchSize();
+      int currentBatchIndex = currentMessageId.getBatchIndex();
+      int currentBatchSize = currentMessageId.getBatchSize();
 
       if (currentBatchIndex < currentBatchSize - 1) {
         nextMessageId =
             new BatchMessageIdImpl(currentLedgerId, currentEntryId, currentPartitionIndex, currentBatchIndex + 1,
-                currentBatchSize, ((BatchMessageIdImpl) currentMessageId).getAcker());
+                currentBatchSize, currentMessageId.getAckSet());
       } else {
         nextMessageId =
             new BatchMessageIdImpl(currentLedgerId, currentEntryId + 1, currentPartitionIndex, 0, currentBatchSize,
-                ((BatchMessageIdImpl) currentMessageId).getAcker());
+                currentMessageId.getAckSet());
       }
     } else {
       nextMessageId = DefaultImplementation.getDefaultImplementation()

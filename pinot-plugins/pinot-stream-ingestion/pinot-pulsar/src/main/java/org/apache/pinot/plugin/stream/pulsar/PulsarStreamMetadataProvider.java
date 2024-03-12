@@ -112,7 +112,7 @@ public class PulsarStreamMetadataProvider extends PulsarPartitionLevelConnection
         throw new IllegalArgumentException("Unknown initial offset value " + offsetCriteria);
       }
       return new MessageIdStreamOffset(offset);
-    } catch (PulsarClientException e) {
+    } catch (Exception e) {
       LOGGER.error("Cannot fetch offsets for partition " + _partition + " and topic " + _topic + " and offsetCriteria "
           + offsetCriteria, e);
       return null;

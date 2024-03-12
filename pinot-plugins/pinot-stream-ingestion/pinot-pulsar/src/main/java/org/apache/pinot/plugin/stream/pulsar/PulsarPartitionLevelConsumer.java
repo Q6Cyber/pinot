@@ -18,22 +18,27 @@
  */
 package org.apache.pinot.plugin.stream.pulsar;
 
-import com.google.common.collect.Iterables;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
 import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
 import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageId;
-import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Reader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +51,7 @@ public class PulsarPartitionLevelConsumer extends PulsarPartitionLevelConnection
     implements PartitionGroupConsumer {
   private static final Logger LOGGER = LoggerFactory.getLogger(PulsarPartitionLevelConsumer.class);
   private final ExecutorService _executorService;
+  private final ScheduledExecutorService _scheduledExecutorService;
   private final Reader _reader;
   private boolean _enableKeyValueStitch;
 
@@ -59,6 +65,7 @@ public class PulsarPartitionLevelConsumer extends PulsarPartitionLevelConnection
     LOGGER.info("Created pulsar reader with id {} for topic {} partition {}", _reader, _config.getPulsarTopicName(),
         partitionGroupConsumptionStatus.getPartitionGroupId());
     _executorService = Executors.newSingleThreadExecutor();
+    _scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
     _enableKeyValueStitch = _config.getEnableKeyValueStitch();
   }
 
@@ -75,31 +82,61 @@ public class PulsarPartitionLevelConsumer extends PulsarPartitionLevelConnection
     final MessageId endMessageId =
         endMsgOffset == null ? MessageId.latest : ((MessageIdStreamOffset) endMsgOffset).getMessageId();
 
-    List<PulsarStreamMessage> messagesList = new ArrayList<>();
-    Future<PulsarMessageBatch> pulsarResultFuture =
-        _executorService.submit(() -> fetchMessages(startMessageId, endMessageId, messagesList));
+    final BlockingQueue<PulsarStreamMessage> messageQueue = new LinkedBlockingQueue<>();
+    final AtomicBoolean timeoutReached = new AtomicBoolean(false);
+    final AtomicReference<CompletableFuture<Boolean>> pulsarHasMessagesFutureRef = new AtomicReference<>();
+    Future<?> pulsarResultFuture =
+        _executorService.submit(() -> fetchMessages(startMessageId, endMessageId, messageQueue::add, timeoutReached,
+            pulsarHasMessagesFutureRef));
+    //schedule a thread at the fetch timeout time to cleanly stop the pulsar read.
+    _scheduledExecutorService.schedule(() -> {
+      timeoutReached.set(true);
+      if (pulsarHasMessagesFutureRef.get() != null) {
+        CompletableFuture<Boolean> hasMessageFuture = pulsarHasMessagesFutureRef.get();
+        if (!hasMessageFuture.isDone()) {
+          hasMessageFuture.completeExceptionally(
+              new TimeoutException("Timeout while waiting for message availability"));
+        }
+      }
+    }, timeoutMillis, TimeUnit.MILLISECONDS);
 
     try {
-      return pulsarResultFuture.get(timeoutMillis, TimeUnit.MILLISECONDS);
-    } catch (TimeoutException e) {
+      pulsarResultFuture.get();
+    } catch (Exception e) {
       // The fetchMessages has thrown an exception. Most common cause is the timeout.
       // We return the records fetched till now along with the next start offset.
-      pulsarResultFuture.cancel(true);
-      return new PulsarMessageBatch(buildOffsetFilteringIterable(messagesList, startMessageId, endMessageId),
-          _enableKeyValueStitch);
-    } catch (Exception e) {
+      boolean cancelSuccess = pulsarResultFuture.cancel(true);
+      if (!cancelSuccess) {
+        LOGGER.warn("Failed to cancel the fetchMessages task");
+      }
       LOGGER.warn("Error while fetching records from Pulsar", e);
-      return new PulsarMessageBatch(buildOffsetFilteringIterable(messagesList, startMessageId, endMessageId),
-          _enableKeyValueStitch);
     }
+    LOGGER.debug("Fetched {} records from Pulsar", messageQueue.size());
+    List<PulsarStreamMessage> messageList = new ArrayList<>(messageQueue.size());
+    messageQueue.drainTo(messageList);
+    messageList.removeIf(message -> !messageIsValidAndInRange(message, startMessageId, endMessageId));
+    LOGGER.debug("Creating batch of {} records.", messageList.size());
+
+    return new PulsarMessageBatch(messageList, _enableKeyValueStitch);
   }
 
-  public PulsarMessageBatch fetchMessages(MessageId startMessageId, MessageId endMessageId,
-      List<PulsarStreamMessage> messagesList) {
+  public void fetchMessages(MessageId startMessageId, MessageId endMessageId,
+      Consumer<PulsarStreamMessage> messageConsumer, AtomicBoolean timeoutReached,
+      AtomicReference<CompletableFuture<Boolean>> pulsarHasMessagesFuture) {
     try {
       _reader.seek(startMessageId);
 
-      while (_reader.hasMessageAvailable()) {
+      while (!timeoutReached.get()) {
+        CompletableFuture<Boolean> hasMessageFuture = _reader.hasMessageAvailableAsync();
+        pulsarHasMessagesFuture.set(hasMessageFuture);
+        try {
+          if (!hasMessageFuture.get()) {
+            break;
+          }
+        } catch (Exception e) {
+          LOGGER.warn("Error while waiting for message availability.", e);
+          break;
+        }
         Message<byte[]> nextMessage = _reader.readNext();
 
         if (endMessageId != null) {
@@ -107,48 +144,41 @@ public class PulsarPartitionLevelConsumer extends PulsarPartitionLevelConnection
             break;
           }
         }
-        messagesList.add(
+        messageConsumer.accept(
             PulsarUtils.buildPulsarStreamMessage(nextMessage, _enableKeyValueStitch, _pulsarMetadataExtractor));
 
         if (Thread.interrupted()) {
           break;
         }
       }
-
-      return new PulsarMessageBatch(buildOffsetFilteringIterable(messagesList, startMessageId, endMessageId),
-          _enableKeyValueStitch);
-    } catch (PulsarClientException e) {
+    } catch (Exception e) {
       LOGGER.warn("Error consuming records from Pulsar topic", e);
-      return new PulsarMessageBatch(buildOffsetFilteringIterable(messagesList, startMessageId, endMessageId),
-          _enableKeyValueStitch);
     }
   }
 
-  private Iterable<PulsarStreamMessage> buildOffsetFilteringIterable(final List<PulsarStreamMessage> messageAndOffsets,
-      final MessageId startOffset, final MessageId endOffset) {
-    return Iterables.filter(messageAndOffsets, input -> {
-      // Filter messages that are either null or have an offset ∉ [startOffset, endOffset]
-      return input != null && input.getValue() != null && (input.getMessageId().compareTo(startOffset) >= 0) && (
-          (endOffset == null) || (input.getMessageId().compareTo(endOffset) < 0));
-    });
+  private boolean messageIsValidAndInRange(PulsarStreamMessage message, final MessageId startOffset,
+      final MessageId endOffset) {
+    return message != null && message.getValue() != null
+        && (message.getMessageId().compareTo(startOffset) >= 0)
+        && (endOffset == null) || (message.getMessageId().compareTo(endOffset) < 0);
   }
-
   @Override
   public void close()
       throws IOException {
     _reader.close();
     super.close();
-    shutdownAndAwaitTermination();
+    shutdownAndAwaitTermination(_scheduledExecutorService);
+    shutdownAndAwaitTermination(_executorService);
   }
 
-  void shutdownAndAwaitTermination() {
-    _executorService.shutdown();
+  void shutdownAndAwaitTermination(ExecutorService executorService) {
+    executorService.shutdown();
     try {
-      if (!_executorService.awaitTermination(60, TimeUnit.SECONDS)) {
-        _executorService.shutdownNow();
+      if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+        executorService.shutdownNow();
       }
     } catch (InterruptedException ie) {
-      _executorService.shutdownNow();
+      executorService.shutdownNow();
       Thread.currentThread().interrupt();
     }
   }

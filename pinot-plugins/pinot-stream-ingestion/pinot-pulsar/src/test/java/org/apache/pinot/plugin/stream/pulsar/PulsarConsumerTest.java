@@ -373,10 +373,14 @@ public class PulsarConsumerTest {
   }
 
   private MessageId getMessageIdForPartitionAndIndex(int partitionNum, int index) {
-    MessageId startMessageIdRaw = _partitionToFirstMessageIdMap.get(partitionNum);
-    MessageIdImpl startMessageId = MessageIdImpl.convertToMessageIdImpl(startMessageIdRaw);
-    return DefaultImplementation.getDefaultImplementation()
-        .newMessageId(startMessageId.getLedgerId(), index, partitionNum);
+    try {
+      MessageId startMessageIdRaw = _partitionToFirstMessageIdMap.get(partitionNum);
+      MessageIdImpl startMessageId = (MessageIdImpl) MessageIdImpl.fromByteArray(startMessageIdRaw.toByteArray());
+      return DefaultImplementation.getDefaultImplementation()
+          .newMessageId(startMessageId.getLedgerId(), index, partitionNum);
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to convert MessageId to MessageIdImpl", e);
+    }
   }
 
   private MessageId getBatchMessageIdForPartitionAndIndex(int partitionNum, int index) {
